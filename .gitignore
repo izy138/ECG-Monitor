@@ -1,0 +1,8 @@
+data/
+*.pt
+*.onnx
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
+node_modules/

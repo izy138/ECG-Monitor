@@ -1,0 +1,8 @@
+# Phase 1 — data pipeline
+numpy>=1.24
+scipy>=1.10
+wfdb>=4.1
+matplotlib>=3.7
+pytest>=7.4
+# Phase 2 adds: torch, scikit-learn
+# Phase 3 adds: fastapi, uvicorn, neurokit2, asyncpg
