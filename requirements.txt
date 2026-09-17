@@ -4,5 +4,7 @@ scipy>=1.10
 wfdb>=4.1
 matplotlib>=3.7
 pytest>=7.4
-# Phase 2 adds: torch, scikit-learn
+# Phase 2 — training
+torch>=2.0
+scikit-learn>=1.3
 # Phase 3 adds: fastapi, uvicorn, neurokit2, asyncpg

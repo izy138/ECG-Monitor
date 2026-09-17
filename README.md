@@ -3,7 +3,7 @@
 Classifies individual heartbeats from MIT-BIH ECG recordings (Normal, Supraventricular,
 Ventricular, Fusion) and streams results to a live dashboard.
 
-**Status:** Phase 1 (data pipeline) built and tested. Phases 2–5 to come.
+**Status:** Phase 1 (data pipeline) and Phase 2 (training) built. Phases 3–5 to come.
 
 ## Setup
 
@@ -22,6 +22,20 @@ python -m ecg.inspect_dataset           # writes data/processed/inspect_train.pn
 
 Outputs in `data/processed/`: `train.npz`, `val.npz`, `test.npz`, `metadata.json`.
 
+## Phase 2 — train the classifier
+
+```bash
+python -m ecg.train                    # trains with early stopping on val macro-F1
+python -m ecg.train --epochs 30 --batch-size 256
+python -m ecg.train --evaluate-only   # re-run metrics from models/best.pt
+```
+
+Outputs in `models/`: `best.pt`, `history.json`, `metrics.json`, `confusion_val.png`, `confusion_test.png`.
+
+The CNN takes a 200-sample beat plus 4 RR-interval features. Training uses class-weighted
+cross-entropy and ±5-sample R-peak jitter. The test set is evaluated once at the end — never
+used for early stopping.
+
 ## Layout
 
 ```
@@ -30,6 +44,8 @@ ecg/
   preprocessing.py   bandpass, windowing, z-score, RR-interval features
   build_dataset.py   Phase 1 CLI
   inspect_dataset.py sanity-check plots
+  model.py           1D CNN + RR head
+  train.py           Phase 2 CLI
 tests/
 ```
 
