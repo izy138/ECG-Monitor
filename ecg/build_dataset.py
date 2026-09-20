@@ -43,7 +43,17 @@ def ensure_downloaded(raw_dir: Path, records) -> None:
 # Per-record processing
 # ---------------------------------------------------------------------------
 def process_record(record_path: Path):
-    """Filter the whole record, then cut beats. Returns (arrays dict, skip-reason Counter)."""
+    """Filter the whole record, then cut beats. Returns (arrays dict, skip-reason Counter).
+
+    Drops beats with an implausible RR gap (config.RR_MIN_S/RR_MAX_S) at build time, which
+    keeps the annotation-gap outliers out of train's statistics entirely. This is
+    complementary to, not redundant with, the clip in preprocessing.fit_rr_scaler/
+    apply_rr_scaler: dropping protects the offline dataset (and prevents a gap beat's own
+    sample from ever being learned from), while the scaler's clip protects a future
+    streaming beat at inference time, which can't simply be dropped mid-stream, and also
+    catches beats whose OWN pre/post RR is plausible but whose pre_rr_ratio/post_rr_ratio is
+    still contaminated because a neighboring beat's gap skewed the local-median denominator.
+    """
     import wfdb
 
     rec = wfdb.rdrecord(str(record_path))
@@ -74,6 +84,13 @@ def process_record(record_path: Path):
             continue
         if not np.all(np.isfinite(rr_all[i])):
             skipped["insufficient_rr_context"] += 1
+            continue
+        pre_rr_s, post_rr_s = rr_all[i, 0], rr_all[i, 1]
+        if not (C.RR_MIN_S <= pre_rr_s <= C.RR_MAX_S and C.RR_MIN_S <= post_rr_s <= C.RR_MAX_S):
+            # Finite but physiologically implausible: an annotation gap, not a real beat-
+            # to-beat interval (see config.RR_MIN_S/RR_MAX_S). Same kind of untrustworthy RR
+            # context as the NaN case above, just not NaN, so it gets its own counter.
+            skipped["implausible_rr_gap"] += 1
             continue
         window = extract_window(signal, peak)
         if window is None:
@@ -225,6 +242,10 @@ def main(argv=None) -> None:
             "Split follows de Chazal et al. (2004); paced records 102, 104, 107, 217 excluded.",
             "Records 201 (DS1) and 202 (DS2) are the same patient.",
             "Test set (DS2) must not be used for model selection or early stopping.",
+            f"Beats with pre_rr_s/post_rr_s outside [{C.RR_MIN_S}, {C.RR_MAX_S}] seconds are "
+            "dropped (skipped_beats.implausible_rr_gap): these are MIT-BIH annotation gaps "
+            "(dropped/unreadable annotations), not real asystole, and were inflating RR "
+            "normalization statistics before this fix.",
         ],
     }
     (args.out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))

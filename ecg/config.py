@@ -67,3 +67,27 @@ CLASS_NAMES = {
 }
 
 RR_FEATURE_NAMES = ("pre_rr_s", "post_rr_s", "pre_rr_ratio", "post_rr_ratio")
+
+# --- RR feature physiological bounds --------------------------------------
+# MIT-BIH annotation files contain a handful of multi-second-to-100-second gaps between
+# consecutive beat annotations (dropped/unreadable annotations, not real asystole). Left
+# unclipped, these dominate any mean/std fit on pre_rr_s/post_rr_s/pre_rr_ratio/post_rr_ratio
+# and crush the real distribution into a few hundredths of a sigma. Used by
+# ecg.preprocessing.fit_rr_scaler/apply_rr_scaler (clip-then-standardize) and by
+# ecg.build_dataset.process_record's "implausible_rr_gap" drop gate -- one set of bounds,
+# two complementary defenses (see build_dataset docstring for why both are needed).
+#
+# Evidence (data/processed/train.npz, 40155 train beats, current inter-patient split): the
+# real RR distribution is dense and continuous up to ~2.5s (p99.9 = 1.89s; only 1 beat in
+# [2.5s, 3.0s)), then falls off a cliff -- the next beat above 3.0s sits at 3.7s, and beyond
+# that values jump straight to 5-100s (annotation gaps). pre_rr_ratio/post_rr_ratio show the
+# identical cliff: dense up to ~2.5-3.0 (p99.9 = 2.57), then a hard drop to just 3 beats in
+# [3, 4). Genuine class medians for pre_rr_ratio -- the main discriminative RR signal -- are
+# all in [0.74, 1.00] (N 1.004, S 0.815, V 0.742, F 0.995), far below these bounds, so real
+# signal is untouched.
+RR_MIN_S = 0.2       # 300 bpm ceiling on heart rate. No training beat is this fast today
+                     # (min observed = 0.25s); kept as a defensive floor for a future
+                     # streaming beat, where a double-detected peak could read near 0.
+RR_MAX_S = 3.0       # 20 bpm floor -- sits in the cliff between the real tail (<=2.5s) and
+                     # the annotation-gap outliers (>=3.7s, up to 100s).
+RR_RATIO_MAX = 3.0   # Same cliff, expressed as a ratio to the local rhythm baseline.

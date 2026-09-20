@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, Dataset  # noqa: E402
 
 from . import config as C  # noqa: E402
 from .model import BeatCNN  # noqa: E402
+from .preprocessing import apply_rr_scaler, fit_rr_scaler  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +45,9 @@ def shift_window(window: np.ndarray, shift: int) -> np.ndarray:
 
 class BeatDataset(Dataset):
     def __init__(self, X: np.ndarray, rr: np.ndarray, y: np.ndarray,
-                 rr_mean: np.ndarray, rr_std: np.ndarray,
-                 jitter: int = 0, seed: int = 0):
+                 rr_scaler: dict, jitter: int = 0, seed: int = 0):
         self.X = X
-        self.rr = ((rr - rr_mean) / rr_std).astype(np.float32)
+        self.rr = apply_rr_scaler(rr, rr_scaler)
         self.y = y.astype(np.int64)
         self.jitter = jitter
         self.rng = np.random.default_rng(seed)
@@ -73,17 +73,30 @@ def load_split(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return data["X"], data["rr"], data["y"]
 
 
-def rr_norm_stats(rr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    mean = rr.mean(axis=0)
-    std = rr.std(axis=0)
-    std = np.where(std < 1e-6, 1.0, std)
-    return mean.astype(np.float32), std.astype(np.float32)
+def class_weights(y: np.ndarray, scheme: str = "inverse") -> torch.Tensor:
+    """Per-class weights for CrossEntropyLoss's `weight=` argument.
 
+    "inverse" is plain inverse-frequency (the original scheme): weight = total / (n_classes *
+    count). With CrossEntropyLoss, that weight is indexed by each sample's TRUE label, and
+    default reduction='mean' divides by the sum of those per-sample weights -- so a false
+    negative on a rare class costs (weight[rare] / weight[common]) times as much as an
+    equally-confident false positive on that rare class. For this dataset's train counts
+    (N 35879, S 730, V 3150, F 380) that ratio is 26.4 / 0.28 = ~94x in F's favor, which is
+    large enough to make the optimizer trade many cheap true-N misses for a few expensive
+    true-F hits (see backend-engineer-expert's diagnosis for confirming numbers).
 
-def class_weights(y: np.ndarray) -> torch.Tensor:
+    "sqrt_inverse" tempers that: weight = sqrt(inverse-frequency weight). It keeps the same
+    ordering (rarer classes still weighted more) but compresses the ratio between the most
+    and least frequent classes from ~94x to ~sqrt(94) ~= 9.7x, so a rare class still gets
+    priority without being worth sacrificing a large share of the majority class for.
+    """
     counts = np.bincount(y, minlength=len(C.CLASSES)).astype(np.float64)
     counts = np.maximum(counts, 1.0)
     weights = counts.sum() / (len(C.CLASSES) * counts)
+    if scheme == "sqrt_inverse":
+        weights = np.sqrt(weights)
+    elif scheme != "inverse":
+        raise ValueError(f"Unknown class-weighting scheme: {scheme!r}")
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -177,17 +190,17 @@ def train(args: argparse.Namespace) -> Path:
 
     X_train, rr_train, y_train = load_split(args.data_dir / "train.npz")
     X_val, rr_val, y_val = load_split(args.data_dir / "val.npz")
-    rr_mean, rr_std = rr_norm_stats(rr_train)
+    rr_scaler = fit_rr_scaler(rr_train)  # TRAIN split only
 
-    train_ds = BeatDataset(X_train, rr_train, y_train, rr_mean, rr_std,
+    train_ds = BeatDataset(X_train, rr_train, y_train, rr_scaler,
                            jitter=args.jitter, seed=args.seed)
-    val_ds = BeatDataset(X_val, rr_val, y_val, rr_mean, rr_std)
+    val_ds = BeatDataset(X_val, rr_val, y_val, rr_scaler)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=0, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = BeatCNN().to(device)
-    weights = class_weights(y_train).to(device)
+    weights = class_weights(y_train, scheme=args.class_weighting).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -212,8 +225,7 @@ def train(args: argparse.Namespace) -> Path:
             stale = 0
             torch.save({
                 "model_state": model.state_dict(),
-                "rr_mean": rr_mean,
-                "rr_std": rr_std,
+                "rr_scaler": rr_scaler,
                 "val_macro_f1": val_f1,
                 "epoch": epoch,
                 "classes": list(C.CLASSES),
@@ -236,7 +248,13 @@ def evaluate(args: argparse.Namespace, ckpt_path: Path) -> dict:
 
     model = BeatCNN().to(device)
     model.load_state_dict(ckpt["model_state"])
-    rr_mean, rr_std = ckpt["rr_mean"], ckpt["rr_std"]
+    if "rr_scaler" not in ckpt:
+        raise KeyError(
+            f"{ckpt_path} has no 'rr_scaler' entry -- it was saved by an older version of "
+            "train.py (separate rr_mean/rr_std, or an even earlier format). Retrain with the "
+            "current code (python -m ecg.train) to produce a compatible checkpoint."
+        )
+    rr_scaler = ckpt["rr_scaler"]
 
     results = {}
     for split in ("val", "test"):
@@ -245,7 +263,7 @@ def evaluate(args: argparse.Namespace, ckpt_path: Path) -> dict:
             continue
         X, rr, y = load_split(path)
         loader = DataLoader(
-            BeatDataset(X, rr, y, rr_mean, rr_std),
+            BeatDataset(X, rr, y, rr_scaler),
             batch_size=args.batch_size, shuffle=False,
         )
         y_pred, y_true = predict(model, loader, device)
@@ -279,6 +297,16 @@ def main(argv=None) -> None:
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--jitter", type=int, default=5, help="± samples of R-peak shift augmentation")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--class-weighting", choices=["inverse", "sqrt_inverse"], default="sqrt_inverse",
+                    help="CrossEntropyLoss class weighting scheme (see class_weights() docstring). "
+                         "sqrt_inverse is the default: plain inverse-frequency weighting gives F "
+                         "a ~94x true-label loss advantage over N, which the optimizer exploits by "
+                         "sacrificing hundreds of true-N beats to catch a handful of true-F beats "
+                         "(val: 642 N->F false positives for 7/34 true F caught). sqrt_inverse "
+                         "compresses that ratio to ~9.7x, eliminating the N regression at the cost "
+                         "of F recall reverting to near-zero -- an explicit, evidence-based trade "
+                         "(see backend-engineer-expert's report), not a default anyone should flip "
+                         "back without re-running that comparison on val.")
     ap.add_argument("--evaluate-only", action="store_true")
     ap.add_argument("--checkpoint", type=Path, default=None)
     args = ap.parse_args(argv)
