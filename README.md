@@ -41,12 +41,21 @@ used for early stopping.
 
 | class | precision | recall | F1 | support |
 |-------|-----------|--------|-----|---------|
-| N     | 0.961 | 0.977 | 0.969 | 44159 |
-| S     | 0.259 | 0.182 | 0.214 | 1809 |
-| V     | 0.876 | 0.916 | 0.895 | 3219 |
+| N     | 0.960 | 0.982 | 0.971 | 44159 |
+| S     | 0.305 | 0.168 | 0.216 | 1809 |
+| V     | 0.873 | 0.920 | 0.896 | 3219 |
 | F     | 0.000 | 0.000 | 0.000 | 388 |
 
-Test accuracy 0.936, macro-F1 0.520. Validation accuracy 0.975, macro-F1 0.656.
+Test accuracy 0.940, macro-F1 0.521. Validation accuracy 0.976, macro-F1 0.653 (4-class;
+0.856 on the N/S/V selection criterion actually used to pick this checkpoint — see below).
+
+S's headline recall (0.168) is dragged down by one patient: record 232 holds 1354 of test's
+1809 S beats (74.8%) at 0.013 recall, because that patient's S beats arrive at a normal-ish
+interval (`pre_rr_ratio` median 0.99) while their N beats are unusually late (`pre_rr_ratio`
+median 2.51) — the "S arrives early relative to N" relationship the model learns everywhere
+else is inverted in this one patient. **S recall excluding record 232 is 0.626** (455 beats).
+Both figures are in `models/metrics.json` (`splits.test.per_record_recall`,
+`splits.test.s_recall_excluding_record_232`) so this isn't just a conversational aside.
 
 These are true inter-patient numbers. Intra-patient splits (beats from the same patient in
 both train and test) routinely report 95–98% accuracy on this dataset; those figures are not
@@ -101,4 +110,20 @@ tests/
   catch 7 of 34 true fusion beats, dropping N recall from 0.997 to 0.930. `sqrt_inverse`
   compresses that ratio to ~9.7×. Pass `--class-weighting inverse` to reproduce the old
   behavior.
+- **Checkpoint selection uses val macro-F1 over N/S/V only** (`SELECTION_CLASSES` in
+  `train.py`), not the full 4-class average. F is excluded because it's confirmed unlearnable
+  from this data (see above), not because excluding it makes selection less noisy — it
+  doesn't: the N/S/V-only band's coefficient of variation (~0.041, epochs 3–16) is essentially
+  identical to the 4-class band's (~0.041). Selection is noisy either way; the source is
+  minority-class val counts in general (S has only 213 val beats), not F specifically. F stays
+  a trained output class and stays in every reported number regardless of this flag.
+- **`--weight-decay` defaults to `1e-4`, a real but marginal fix for that selection noise, not
+  a solved problem.** train_loss falls steeply (0.458→0.053 over 16 epochs) while val_loss
+  stays flat/noisy from ~epoch 4 on — classic overfitting. Adam weight decay was compared
+  against BeatCNN's alternative (raising its single head-layer `dropout`, which would leave
+  the conv feature extractor — most of the model's capacity — untouched): 1e-4 lowers the
+  N/S/V selection-F1 band's std from 0.033 to 0.025 (CoV 0.041→0.031) and final-epoch val_loss
+  from 0.612 to 0.603, but the selected epoch and its metric barely move (0.8585→0.8565, same
+  epoch). 1e-3 is worse, not just unhelpful — it reintroduces N→F confusion (4→164 beats) and
+  drops S's F1 (0.73→0.60) without closing the loss gap either.
 - Known caveat: records 201 (DS1) and 202 (DS2) come from the same patient.

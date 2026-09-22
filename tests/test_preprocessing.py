@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from ecg import config as C
-from ecg.preprocessing import bandpass, extract_window, rr_features, zscore
+from ecg.preprocessing import bandpass, extract_window, resample_record, rr_features, zscore
 
 
 # --- config ---------------------------------------------------------------
@@ -17,6 +17,47 @@ def test_record_lists_are_consistent():
 def test_aami_map_targets_known_classes():
     assert set(C.AAMI_MAP.values()) == set(C.CLASSES)
     assert set(C.AAMI_MAP) <= C.BEAT_SYMBOLS
+
+
+def test_db_lead_preference_covers_every_source():
+    assert set(C.DB_LEAD_PREFERENCE) == {"mitdb", "incartdb", "svdb"}
+    assert C.DB_LEAD_PREFERENCE["mitdb"] == (C.LEAD,)
+
+
+# --- resample_record --------------------------------------------------------
+def test_resample_record_incart_ratio():
+    # INCART's real native fs (257 Hz, prime -- doesn't reduce): 5 seconds of signal.
+    native_fs = 257
+    n = 5 * native_fs
+    sig = np.sin(2 * np.pi * 1.0 * np.arange(n) / native_fs)
+    ann_samples = np.array([0, native_fs, 2 * native_fs])  # one beat per second, by construction
+
+    out_sig, out_samples = resample_record(sig, ann_samples, native_fs, target_fs=C.FS)
+
+    # Exact ratio: len scales by up/down = 360/257 (no reduction, 257 is prime).
+    assert len(out_sig) == round(n * 360 / 257)
+    # Annotation samples land near their scaled positions (beats 1s apart -> ~360 samples apart
+    # at the new rate), not exactly at the naive float scale, because of the resample_poly
+    # delay/edge behavior on such a short signal -- so this checks proportional spacing, not
+    # an exact index.
+    diffs = np.diff(out_samples)
+    assert np.allclose(diffs, C.FS, atol=2)
+
+
+def test_resample_record_svdb_ratio_reduces():
+    # SVDB's real native fs (128 Hz): 360/128 reduces to 45/16, not 360/128.
+    native_fs = 128
+    n = 3 * native_fs
+    sig = np.zeros(n)
+    ann_samples = np.array([0, native_fs])
+
+    out_sig, _ = resample_record(sig, ann_samples, native_fs, target_fs=C.FS)
+    assert len(out_sig) == round(n * 45 / 16)
+
+
+def test_resample_record_rejects_matching_fs():
+    with pytest.raises(ValueError):
+        resample_record(np.zeros(10), np.array([0, 5]), native_fs=C.FS, target_fs=C.FS)
 
 
 # --- bandpass -------------------------------------------------------------

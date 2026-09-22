@@ -4,8 +4,12 @@
     python -m ecg.train --epochs 30 --batch-size 256
     python -m ecg.train --evaluate-only --checkpoint models/best.pt
 
-Early-stops on validation macro-F1. The test set is evaluated once at the end (or via
---evaluate-only) and must not be used for model selection.
+Early-stops on validation macro-F1 restricted to N/S/V (see SELECTION_CLASSES -- F is excluded
+because it's confirmed unlearnable from this data, NOT because excluding it reduces selection
+noise; it doesn't, see the comment there. F is still trained, evaluated, and reported
+everywhere else). Selection noise itself is mitigated by a small --weight-decay default
+(marginal, not a fix -- see that flag's help text). The test set is evaluated once at the end
+(or via --evaluate-only) and must not be used for model selection.
 """
 
 import argparse
@@ -68,8 +72,12 @@ class BeatDataset(Dataset):
         )
 
 
-def load_split(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_split(path: Path, with_record: bool = False) -> tuple[np.ndarray, ...]:
+    """(X, rr, y), or (X, rr, y, record) when with_record=True (used for test's per-record
+    breakdown -- record is never needed for training or the BeatDataset itself)."""
     data = np.load(path)
+    if with_record:
+        return data["X"], data["rr"], data["y"], data["record"]
     return data["X"], data["rr"], data["y"]
 
 
@@ -142,8 +150,42 @@ def run_epoch(model: BeatCNN, loader: DataLoader, criterion: nn.Module,
     return total_loss / max(n, 1)
 
 
-def macro_f1(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+def macro_f1(y_true: np.ndarray, y_pred: np.ndarray, classes: tuple[str, ...] | None = None) -> float:
+    """Macro-F1, optionally restricted to a subset of C.CLASSES (by name).
+
+    `classes=None` scores all classes (used for reporting). A restricted subset is used for
+    checkpoint selection -- see SELECTION_CLASSES below for why F is excluded from it by
+    default.
+    """
+    labels = [C.CLASS_TO_IDX[c] for c in classes] if classes is not None else None
+    return float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0))
+
+
+# Checkpoint selection is noisy at this dataset's size: across a real training run (see
+# models/history.json from an earlier round), 4-class val macro-F1 over epochs 3-16 had
+# mean 0.6104, population std 0.0251 (coefficient of variation ~0.041), and the epoch that
+# got selected as "best" sat 1.81 sigma above that mean -- selection was picking the max of
+# a noisy signal, not a converged optimum.
+#
+# F was the original suspect (380 train beats, 97.9% from one record, only 34 val beats), but
+# that hypothesis was checked and is WRONG: restricting the selection metric to N/S/V does
+# NOT reduce the noise. The N/S/V-only band's CoV (~0.041, measured with weight_decay=0.0) is
+# essentially identical to the 4-class band's (~0.041) -- excluding F does not stabilize
+# anything. The absolute metric value jumps from ~0.61 to ~0.86 when F is dropped, but that's
+# a mechanical artifact of averaging over 3 classes instead of 4 with a near-zero class
+# removed, not an improvement in signal quality. The real instability source is minority-class
+# val counts in general -- S has only 213 val beats, and that alone is enough noise to produce
+# a similar CoV whether or not F is in the average.
+#
+# F is still excluded from SELECTION here (not from training, evaluation, or reporting -- F
+# stays a trained output class and stays in every metrics.json/README number), but the
+# justification is narrower than "it reduces noise": F is confirmed unlearnable from this data
+# (see backend-engineer-expert's prior report), so there is no reason to let an unlearnable
+# class's noise influence which epoch gets kept, even though removing it doesn't make the
+# remaining signal any less noisy. Selection noise itself is mitigated separately, by
+# --weight-decay (see main()); it was not fixed by this exclusion and no further exclusion
+# should be assumed to fix it either.
+SELECTION_CLASSES: tuple[str, ...] = ("N", "S", "V")
 
 
 def evaluate_split(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
@@ -163,6 +205,41 @@ def evaluate_split(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         "macro_f1": macro_f1(y_true, y_pred),
         "per_class": {c: report[c] for c in C.CLASSES},
         "confusion_matrix": cm.tolist(),
+    }
+
+
+def per_record_recall(record: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Recall per (record, class), for classes that actually occur in that record.
+
+    A single record can dominate a class's headline recall (see the record-232/class-S case
+    in evaluate()); this breaks that open so it doesn't hide behind an aggregate number.
+    """
+    out: dict = {}
+    for r in sorted(set(record.tolist())):
+        mask = record == r
+        row = {}
+        for c in C.CLASSES:
+            idx = C.CLASS_TO_IDX[c]
+            true_in_class = mask & (y_true == idx)
+            n = int(true_in_class.sum())
+            if n == 0:
+                continue
+            row[c] = {"recall": float((y_pred[true_in_class] == idx).mean()), "support": n}
+        if row:
+            out[str(r)] = row
+    return out
+
+
+def class_recall_excluding(y_true: np.ndarray, y_pred: np.ndarray, record: np.ndarray,
+                           cls: str, exclude_records: tuple[str, ...]) -> dict:
+    """Recall for one class, computed only over beats NOT in `exclude_records`."""
+    idx = C.CLASS_TO_IDX[cls]
+    mask = (y_true == idx) & ~np.isin(record, exclude_records)
+    n = int(mask.sum())
+    return {
+        "recall": float((y_pred[mask] == idx).mean()) if n else None,
+        "support": n,
+        "excluded_records": list(exclude_records),
     }
 
 
@@ -202,43 +279,47 @@ def train(args: argparse.Namespace) -> Path:
     model = BeatCNN().to(device)
     weights = class_weights(y_train, scheme=args.class_weighting).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = args.out_dir / "best.pt"
     history = []
-    best_f1 = -1.0
+    best_selection_f1 = -1.0
     stale = 0
 
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(model, train_loader, criterion, device, optimizer)
         val_loss = run_epoch(model, val_loader, criterion, device)
         y_pred, y_true = predict(model, val_loader, device)
-        val_f1 = macro_f1(y_true, y_pred)
-        history.append({"epoch": epoch, "train_loss": train_loss,
-                        "val_loss": val_loss, "val_macro_f1": val_f1})
+        val_f1_all = macro_f1(y_true, y_pred)                              # reporting only
+        val_f1_selection = macro_f1(y_true, y_pred, classes=tuple(args.selection_classes))  # checkpoint criterion
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
+                        "val_macro_f1": val_f1_all, "val_selection_f1": val_f1_selection})
         print(f"epoch {epoch:3d}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"val_macro_f1={val_f1:.4f}")
+              f"val_macro_f1={val_f1_all:.4f}  val_selection_f1={val_f1_selection:.4f}")
 
-        if val_f1 > best_f1:
-            best_f1 = val_f1
+        if val_f1_selection > best_selection_f1:
+            best_selection_f1 = val_f1_selection
             stale = 0
             torch.save({
                 "model_state": model.state_dict(),
                 "rr_scaler": rr_scaler,
-                "val_macro_f1": val_f1,
+                "val_macro_f1": val_f1_all,
+                "val_selection_f1": val_f1_selection,
+                "selection_classes": list(args.selection_classes),
                 "epoch": epoch,
                 "classes": list(C.CLASSES),
             }, ckpt_path)
-            print(f"  -> saved checkpoint (val_macro_f1={val_f1:.4f})")
+            print(f"  -> saved checkpoint (val_selection_f1={val_f1_selection:.4f}, "
+                  f"val_macro_f1={val_f1_all:.4f})")
         else:
             stale += 1
             if stale >= args.patience:
-                print(f"Early stopping at epoch {epoch} (no val F1 improvement for {args.patience} epochs)")
+                print(f"Early stopping at epoch {epoch} (no val selection-F1 improvement for {args.patience} epochs)")
                 break
 
     (args.out_dir / "history.json").write_text(json.dumps(history, indent=2))
-    print(f"\nBest validation macro-F1: {best_f1:.4f}")
+    print(f"\nBest validation selection-F1 ({', '.join(args.selection_classes)}): {best_selection_f1:.4f}")
     return ckpt_path
 
 
@@ -261,13 +342,24 @@ def evaluate(args: argparse.Namespace, ckpt_path: Path) -> dict:
         path = args.data_dir / f"{split}.npz"
         if not path.exists():
             continue
-        X, rr, y = load_split(path)
+        # test only: record is loaded for the per-record breakdown below, nothing else uses it.
+        loaded = load_split(path, with_record=(split == "test"))
+        X, rr, y = loaded[0], loaded[1], loaded[2]
         loader = DataLoader(
             BeatDataset(X, rr, y, rr_scaler),
             batch_size=args.batch_size, shuffle=False,
         )
         y_pred, y_true = predict(model, loader, device)
         results[split] = evaluate_split(split, y_true, y_pred)
+        if split == "test":
+            record = loaded[3]
+            results[split]["per_record_recall"] = per_record_recall(record, y_true, y_pred)
+            # Record 232 holds ~75% of test's S beats and shows an INVERTED early-beat
+            # relationship (S pre_rr_ratio median ~0.99, N's ~2.51 in that record) versus the
+            # "S arrives early" pattern the model learns everywhere else -- it drags the
+            # headline S recall down without reflecting how S performs elsewhere. See README.
+            results[split]["s_recall_excluding_record_232"] = class_recall_excluding(
+                y_true, y_pred, record, "S", exclude_records=("232",))
         save_confusion_matrix(
             np.array(results[split]["confusion_matrix"]),
             args.out_dir / f"confusion_{split}.png",
@@ -279,6 +371,8 @@ def evaluate(args: argparse.Namespace, ckpt_path: Path) -> dict:
         "checkpoint": str(ckpt_path),
         "checkpoint_epoch": ckpt.get("epoch"),
         "checkpoint_val_macro_f1": ckpt.get("val_macro_f1"),
+        "checkpoint_val_selection_f1": ckpt.get("val_selection_f1"),
+        "checkpoint_selection_classes": ckpt.get("selection_classes"),
         "splits": results,
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -295,8 +389,27 @@ def main(argv=None) -> None:
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--patience", type=int, default=8)
+    ap.add_argument("--weight-decay", type=float, default=1e-4,
+                    help="Adam L2 weight decay. Compared against the train/val loss gap (train_loss "
+                         "0.4583->0.0525 over 16 epochs while val_loss stays flat/noisy from ~epoch "
+                         "4 on) and the N/S/V-only selection-F1 noise band (epochs 3-16): 1e-4 gives "
+                         "a real but MARGINAL improvement, not a fix -- band std 0.0332->0.0252 "
+                         "(CoV 0.041->0.031), final-epoch val_loss 0.6121->0.6031, but the selected "
+                         "epoch and its val metric are essentially unchanged (0.8585 vs 0.8565, "
+                         "same epoch 8) and the train/val loss gap itself is still wide. 1e-3 is "
+                         "worse, not just unhelpful: it measurably hurt val N/S (N-as-F confusion "
+                         "4->164 beats, S F1 0.73->0.60) without closing the gap either. Don't "
+                         "describe 1e-4 as having solved the overfitting -- it hasn't; re-run the "
+                         "val-only comparison (see SELECTION_CLASSES comment) before changing this "
+                         "default further.")
     ap.add_argument("--jitter", type=int, default=5, help="± samples of R-peak shift augmentation")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--selection-classes", nargs="+", default=list(SELECTION_CLASSES),
+                    help="Classes whose macro-F1 decides which epoch's checkpoint is kept "
+                         "(default: N S V, i.e. all classes except F -- see SELECTION_CLASSES "
+                         "above for why). This does not affect training, evaluation, or "
+                         "reporting: F stays a trained output class and appears in every "
+                         "metrics.json/README number regardless of this flag.")
     ap.add_argument("--class-weighting", choices=["inverse", "sqrt_inverse"], default="sqrt_inverse",
                     help="CrossEntropyLoss class weighting scheme (see class_weights() docstring). "
                          "sqrt_inverse is the default: plain inverse-frequency weighting gives F "

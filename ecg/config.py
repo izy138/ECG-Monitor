@@ -91,3 +91,40 @@ RR_MIN_S = 0.2       # 300 bpm ceiling on heart rate. No training beat is this f
 RR_MAX_S = 3.0       # 20 bpm floor -- sits in the cliff between the real tail (<=2.5s) and
                      # the annotation-gap outliers (>=3.7s, up to 100s).
 RR_RATIO_MAX = 3.0   # Same cliff, expressed as a ratio to the local rhythm baseline.
+
+# --- Multi-database sources (Phase 2.75 build stage) ------------------------
+# MIT-BIH ("mitdb") stays the frozen canonical test set (DS2), exactly as in Phase 1. INCART
+# ("incartdb") and SVDB ("svdb") are TRAINING-only sources (see build_dataset.py's
+# incart_val/incart_holdout carve-out): DS2 must never be touched by anything below.
+#
+# Lead preference per database, tried in order, first match in the record's sig_name wins.
+# mitdb's "MLII" is the existing, unchanged default. incartdb's "II" was confirmed present in
+# a real downloaded record's sig_name (checked at build time, not assumed -- see
+# build_dataset.process_record's lead selection). svdb's "ECG1" is UNDOCUMENTED by PhysioNet
+# and treated as MLII-equivalent as an ASSUMPTION, not a documented fact -- flagged here and
+# in README; svdb only has ECG1/ECG2, no lead names at all.
+DB_LEAD_PREFERENCE: dict[str, tuple[str, ...]] = {
+    "mitdb": (LEAD,),
+    "incartdb": ("II",),
+    "svdb": ("ECG1",),
+}
+
+# St. Petersburg INCART 12-lead Arrhythmia Database: 75 records, native fs=257 Hz.
+INCART_RECORDS = tuple(f"I{i:02d}" for i in range(1, 76))
+
+# MIT-BIH Supraventricular Arrhythmia Database: 78 records of 95 possible in the 800-894
+# numbering (real gaps, not a typo -- e.g. 813-819 and 830-839 don't exist as a block, plus
+# individual gaps like 830 within the numbered ranges are NOT assumed to be the only missing
+# ones; build_dataset.py's downloader handles any missing/corrupt record generically, by
+# catching the failure and skipping+logging, not by special-casing specific record numbers).
+# Native fs=128 Hz.
+SVDB_RECORDS = (
+    "800", "801", "802", "803", "804", "805", "806", "807", "808", "809",
+    "810", "811", "812", "820", "821", "822", "823", "824", "825", "826",
+    "827", "828", "829", "840", "841", "842", "843", "844", "845", "846",
+    "847", "848", "849", "850", "851", "852", "853", "854", "855", "856",
+    "857", "858", "859", "860", "861", "862", "863", "864", "865", "866",
+    "867", "868", "869", "870", "871", "872", "873", "874", "875", "876",
+    "877", "878", "879", "880", "881", "882", "883", "884", "885", "886",
+    "887", "888", "889", "890", "891", "892", "893", "894",
+)

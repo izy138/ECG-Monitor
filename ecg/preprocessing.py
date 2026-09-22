@@ -1,9 +1,10 @@
 """Signal processing shared by dataset building and the streaming inference API."""
 
+import math
 from functools import lru_cache
 
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, resample_poly, sosfiltfilt
 
 from . import config as C
 
@@ -14,6 +15,35 @@ def design_bandpass(fs: float = C.FS, low: float = C.BANDPASS_LOW_HZ,
     # Second-order sections: the (b, a) form is numerically fragile for a 0.5 Hz
     # cutoff at 360 Hz.
     return butter(order, [low, high], btype="bandpass", fs=fs, output="sos")
+
+
+def resample_record(signal: np.ndarray, ann_samples: np.ndarray, native_fs: int,
+                    target_fs: int = C.FS) -> tuple[np.ndarray, np.ndarray]:
+    """Resample a whole record's signal (and its annotation sample indices) from native_fs
+    to target_fs, so everything downstream (bandpass, WINDOW_BEFORE/AFTER, RR-in-seconds) can
+    keep assuming config.FS unchanged.
+
+    Must be called BEFORE bandpass() and BEFORE segmentation -- resampling after filtering (or
+    after windowing) would distort the filter's frequency response and the beat shapes it's
+    meant to preserve. Callers must skip this entirely when native_fs == target_fs (verified
+    by config.FS-native databases like MIT-BIH) rather than routing through it as a no-op --
+    see build_dataset.process_record.
+
+    up/down are the EXACT reduced integer ratio from math.gcd, never a float cast (e.g.
+    360/257 stays 360/257 since 257 is prime; 360/128 reduces to 45/16) -- resample_poly's
+    polyphase filtering is only exact-ratio-safe this way, and casting to a decimal fraction
+    would introduce approximation error scipy doesn't need to make.
+    """
+    if native_fs == target_fs:
+        raise ValueError(f"resample_record called with native_fs == target_fs ({target_fs}); "
+                         "skip the call instead of routing a no-op through it")
+    g = math.gcd(target_fs, native_fs)
+    up, down = target_fs // g, native_fs // g
+    resampled = resample_poly(np.asarray(signal, dtype=np.float64), up, down)
+    scaled_samples = np.round(
+        np.asarray(ann_samples, dtype=np.float64) * up / down
+    ).astype(np.int64)
+    return resampled, scaled_samples
 
 
 def bandpass(signal, fs: float = C.FS) -> np.ndarray:
